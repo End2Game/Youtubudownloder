@@ -85,6 +85,7 @@ struct Item {
     domain: String,
     file: Option<String>,
     dir: String,
+    removing: Option<f64>,
 }
 
 impl Item {
@@ -93,7 +94,7 @@ impl Item {
             id, url, title: String::new(), status: Status::Queued, percent: 0.0,
             speed: String::new(), speed_bps: 0.0, eta: String::new(), size: String::new(),
             tag, child: None, cancel: false, pause: false,
-            dur: String::new(), res: String::new(), domain: String::new(), file: None, dir,
+            dur: String::new(), res: String::new(), domain: String::new(), file: None, dir, removing: None,
         }
     }
 }
@@ -613,6 +614,7 @@ struct App {
     recorded: HashSet<u64>,
     up: UpState,
     filter: Filter,
+    menu: Option<(u64, egui::Pos2)>,
     notice: Option<(String, f64)>,
     last_clip: String,
     clip_check: f64,
@@ -653,6 +655,7 @@ impl App {
             items: Arc::new(Mutex::new(restored)),
             next_id,
             filter: Filter::All,
+            menu: None,
             notice: None,
             last_clip,
             clip_check: 0.0,
@@ -669,7 +672,8 @@ impl App {
     }
 
     fn accent(&self) -> Color32 {
-        Color32::from_rgb(self.s.accent[0], self.s.accent[1], self.s.accent[2])
+        let c = Color32::from_rgb(self.s.accent[0], self.s.accent[1], self.s.accent[2]);
+        if self.s.theme == Theme::Light { mix(c, Color32::BLACK, 0.25) } else { c }
     }
 
     fn apply_theme(&self, ctx: &egui::Context) {
@@ -688,12 +692,27 @@ impl App {
             _ => {}
         }
         let a = self.accent();
+        let light = self.s.theme == Theme::Light;
         let base = v.panel_fill;
-        let text = v.text_color();
+        // яскравий основний текст і помітний приглушений
+        let text = if light { Color32::from_rgb(18, 22, 34) } else { Color32::from_rgb(238, 241, 250) };
+        for w in [
+            &mut v.widgets.noninteractive,
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+            &mut v.widgets.open,
+        ] {
+            w.fg_stroke.color = text;
+        }
+        // у egui приглушений текст = середина між текстом і цим кольором
+        v.widgets.noninteractive.weak_bg_fill = mix(base, text, 0.40);
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, mix(base, text, 0.20));
         let r = Rounding::same(8.0);
 
-        v.selection.bg_fill = a;
-        v.selection.stroke = Stroke::new(1.0_f32, on_color(a));
+        // вибрані кнопки: насичений фон + світла рамка й текст
+        v.selection.bg_fill = mix(base, a, if light { 0.30 } else { 0.45 });
+        v.selection.stroke = Stroke::new(1.5_f32, if light { mix(a, Color32::BLACK, 0.35) } else { mix(a, Color32::WHITE, 0.70) });
         v.hyperlink_color = a;
         v.window_rounding = Rounding::same(12.0);
         v.menu_rounding = Rounding::same(8.0);
@@ -707,9 +726,9 @@ impl App {
         ] {
             w.rounding = r;
         }
-        v.widgets.inactive.bg_fill = mix(base, text, 0.10);
-        v.widgets.inactive.weak_bg_fill = mix(base, text, 0.08);
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, mix(base, text, 0.12));
+        v.widgets.inactive.bg_fill = mix(base, text, 0.14);
+        v.widgets.inactive.weak_bg_fill = mix(base, text, 0.12);
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, mix(base, text, 0.28));
         v.widgets.hovered.bg_fill = mix(base, a, 0.30);
         v.widgets.hovered.weak_bg_fill = mix(base, a, 0.25);
         v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, a);
@@ -724,9 +743,9 @@ impl App {
             s.spacing.interact_size.y = 30.0;
             s.spacing.slider_width = 120.0;
             s.text_styles.insert(TextStyle::Heading, FontId::new(26.0, f_bold()));
-            s.text_styles.insert(TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
-            s.text_styles.insert(TextStyle::Button, FontId::new(15.0, FontFamily::Proportional));
-            s.text_styles.insert(TextStyle::Small, FontId::new(12.5, FontFamily::Proportional));
+            s.text_styles.insert(TextStyle::Body, FontId::new(15.5, FontFamily::Proportional));
+            s.text_styles.insert(TextStyle::Button, FontId::new(15.5, FontFamily::Proportional));
+            s.text_styles.insert(TextStyle::Small, FontId::new(13.0, FontFamily::Proportional));
             s.text_styles.insert(TextStyle::Monospace, FontId::new(13.5, FontFamily::Monospace));
         });
     }
@@ -770,7 +789,7 @@ impl App {
             let mut running = items.iter().filter(|i| i.status == Status::Running).count();
             for it in items.iter_mut() {
                 if running >= self.s.max_parallel { break; }
-                if it.status == Status::Queued {
+                if it.status == Status::Queued && it.removing.is_none() {
                     it.status = Status::Running;
                     it.pause = false;
                     it.cancel = false;
@@ -907,7 +926,7 @@ fn info_chip(ui: &mut egui::Ui, label: &str, value: &str, vcol: Option<Color32>)
     let base = ui.visuals().panel_fill;
     let text = ui.visuals().text_color();
     egui::Frame::none()
-        .stroke(Stroke::new(1.0_f32, mix(base, text, 0.14)))
+        .stroke(Stroke::new(1.0_f32, mix(base, text, 0.30)))
         .rounding(7.0)
         .inner_margin(egui::Margin::symmetric(8.0, 3.0))
         .show(ui, |ui| {
@@ -932,6 +951,15 @@ fn open_folder(path: &str) {
     let _ = Command::new(prog).arg(path).spawn();
 }
 
+fn open_url(url: &str) {
+    #[cfg(target_os = "windows")]
+    { let _ = tool_cmd("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn(); }
+    #[cfg(target_os = "macos")]
+    { let _ = Command::new("open").arg(url).spawn(); }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    { let _ = Command::new("xdg-open").arg(url).spawn(); }
+}
+
 fn open_path(path: &str) {
     #[cfg(target_os = "windows")]
     { let _ = tool_cmd("cmd").args(["/C", "start", "", path]).spawn(); }
@@ -946,6 +974,7 @@ impl eframe::App for App {
         eframe::set_value(storage, "settings", &self.s);
         eframe::set_value(storage, "history", &self.history);
         let saved: Vec<SavedItem> = self.items.lock().unwrap().iter().filter_map(|i| {
+            if i.removing.is_some() { return None; }
             let state = match &i.status {
                 Status::Queued | Status::Running => 0,
                 Status::Paused => 1,
@@ -967,8 +996,9 @@ impl eframe::App for App {
         self.apply_theme(ctx);
         self.start_queued(ctx);
         let accent = self.accent();
-        let green = Color32::from_rgb(80, 200, 120);
-        let red = Color32::from_rgb(230, 80, 80);
+        let light = self.s.theme == Theme::Light;
+        let green = if light { Color32::from_rgb(14, 130, 66) } else { Color32::from_rgb(90, 220, 135) };
+        let red = if light { Color32::from_rgb(190, 34, 44) } else { Color32::from_rgb(255, 105, 105) };
         let snapshot: Vec<Item> = self.items.lock().unwrap().clone();
 
         let now = ctx.input(|i| i.time);
@@ -1125,6 +1155,7 @@ impl eframe::App for App {
 
         let mut cancel_ids = Vec::new();
         let mut pause_ids: Vec<u64> = Vec::new();
+        let mut menu_req: Option<(u64, egui::Pos2)> = None;
         let mut resume_ids: Vec<u64> = Vec::new();
         let mut remove_ids = Vec::new();
         let mut redo_urls: Vec<String> = Vec::new();
@@ -1143,8 +1174,8 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             let base = ui.visuals().panel_fill;
             let text_col = ui.visuals().text_color();
-            let card_fill = mix(base, text_col, 0.05);
-            let card_border = mix(base, text_col, 0.10);
+            let card_fill = mix(base, text_col, 0.07);
+            let card_border = mix(base, text_col, 0.22);
 
             // банер оновлення програми
             match &stage {
@@ -1188,7 +1219,7 @@ impl eframe::App for App {
 
             match self.tab {
                 Tab::Queue => {
-                    let amber = Color32::from_rgb(245, 166, 35);
+                    let amber = if self.s.theme == Theme::Light { Color32::from_rgb(176, 92, 0) } else { Color32::from_rgb(255, 184, 56) };
                     if !self.ytdlp_ok || !self.ffmpeg_ok {
                         let (busy_i, msg, prog, err) = {
                             let i = self.install.lock().unwrap();
@@ -1298,7 +1329,14 @@ impl eframe::App for App {
 
                     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                         for it in visible {
-                            egui::Frame::none()
+                            let stripe = match &it.status {
+                                Status::Done => green,
+                                Status::Paused => amber,
+                                Status::Failed(_) | Status::Canceled => red,
+                                _ => accent,
+                            };
+                            let mut draw_card = |ui: &mut egui::Ui| -> f32 {
+                            let card = egui::Frame::none()
                                 .fill(card_fill)
                                 .stroke(Stroke::new(1.0_f32, card_border))
                                 .rounding(14.0)
@@ -1418,7 +1456,45 @@ impl eframe::App for App {
                                         });
                                     });
                                 });
-                            ui.add_space(4.0);
+                            let rc = card.response.rect;
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(rc.min + egui::vec2(0.0, 12.0), egui::vec2(4.0, (rc.height() - 24.0).max(8.0))),
+                                2.0,
+                                stripe,
+                            );
+                            // правий клік — контекстне меню
+                            if ui.rect_contains_pointer(rc) && ui.input(|i| i.pointer.secondary_clicked()) {
+                                if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) { menu_req = Some((it.id, pos)); }
+                            }
+                            rc.height()
+                            };
+                            let id_h = egui::Id::new(("card_h", it.id));
+                            if let Some(t0) = it.removing {
+                                // згортання + затухання під час видалення
+                                let t = (((now - t0) / 0.25) as f32).clamp(0.0, 1.0);
+                                let e = t * t;
+                                let h_prev: f32 = ui.ctx().data(|d| d.get_temp(id_h)).unwrap_or(80.0);
+                                let w = ui.available_width();
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(w, (h_prev * (1.0 - e)).max(0.0)), egui::Sense::hover());
+                                let mut child = ui.child_ui(rect, egui::Layout::top_down(egui::Align::Min), None);
+                                child.set_clip_rect(rect.intersect(ui.clip_rect()));
+                                child.set_opacity(1.0 - e);
+                                draw_card(&mut child);
+                                ui.add_space(4.0 * (1.0 - e));
+                                ui.ctx().request_repaint();
+                            } else {
+                                // поява: плавний виїзд і проявлення
+                                let first = ui.ctx().data_mut(|d| *d.get_temp_mut_or_insert_with(egui::Id::new(("card_seen", it.id)), || now));
+                                let t = (((now - first) / 0.3) as f32).clamp(0.0, 1.0);
+                                let e = 1.0 - (1.0 - t).powi(3);
+                                if t < 1.0 {
+                                    ui.ctx().request_repaint();
+                                    ui.add_space((1.0 - e) * 14.0);
+                                }
+                                let h = ui.scope(|ui| { ui.set_opacity(e); draw_card(ui) }).inner;
+                                ui.ctx().data_mut(|d| d.insert_temp(id_h, h));
+                                ui.add_space(4.0);
+                            }
                         }
                     });
                 }
@@ -1557,6 +1633,64 @@ impl eframe::App for App {
             }
         });
 
+        // контекстне меню картки
+        if let Some((mid, mpos)) = self.menu {
+            let mut close = false;
+            if let Some(it) = snapshot.iter().find(|i| i.id == mid && i.removing.is_none()) {
+                let area = egui::Area::new(egui::Id::new("card_menu"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(mpos)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(220.0);
+                            ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                                if ui.selectable_label(false, "🔗  Скопіювати посилання").clicked() {
+                                    if let Ok(mut cb) = arboard::Clipboard::new() { let _ = cb.set_text(it.url.clone()); }
+                                    close = true;
+                                }
+                                if ui.selectable_label(false, "🌐  Відкрити в браузері").clicked() {
+                                    open_url(&it.url);
+                                    close = true;
+                                }
+                                match &it.status {
+                                    Status::Queued | Status::Running => {
+                                        if ui.selectable_label(false, "⏸  Пауза").clicked() { pause_ids.push(it.id); close = true; }
+                                    }
+                                    Status::Paused => {
+                                        if ui.selectable_label(false, "▶  Продовжити").clicked() { resume_ids.push(it.id); close = true; }
+                                    }
+                                    Status::Failed(_) | Status::Canceled => {
+                                        if ui.selectable_label(false, "🔄  Повторити").clicked() { resume_ids.push(it.id); close = true; }
+                                    }
+                                    Status::Done => {
+                                        if let Some(f) = it.file.as_ref().filter(|f| Path::new(f.as_str()).exists()) {
+                                            if ui.selectable_label(false, "▶  Відкрити файл").clicked() { open_path(f); close = true; }
+                                        }
+                                        if ui.selectable_label(false, "📂  Відкрити папку").clicked() {
+                                            let d = if it.dir.is_empty() { out_dir.clone() } else { it.dir.clone() };
+                                            open_folder(&d);
+                                            close = true;
+                                        }
+                                    }
+                                }
+                                ui.separator();
+                                if ui.selectable_label(false, RichText::new("🗑  Видалити").color(red)).clicked() {
+                                    remove_ids.push(it.id);
+                                    close = true;
+                                }
+                            });
+                        });
+                    });
+                let r = area.response.rect;
+                let outside = ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().map_or(true, |p| !r.contains(p)));
+                if outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
+            } else {
+                close = true;
+            }
+            if close { self.menu = None; }
+        }
+        if let Some(req) = menu_req { self.menu = Some(req); }
+
         if paste || paste_add {
             if let Ok(mut cb) = arboard::Clipboard::new() {
                 if let Ok(t) = cb.get_text() {
@@ -1620,13 +1754,16 @@ impl eframe::App for App {
                     }
                 }
             }
-            items.retain(|i| {
-                if remove_ids.contains(&i.id) {
-                    if let Some(c) = &i.child { let _ = c.lock().unwrap().kill(); }
-                    return false;
+            for it in items.iter_mut() {
+                let rm = remove_ids.contains(&it.id)
+                    || (clear && matches!(it.status, Status::Done | Status::Failed(_) | Status::Canceled));
+                if rm && it.removing.is_none() {
+                    it.cancel = true;
+                    if let Some(c) = &it.child { let _ = c.lock().unwrap().kill(); }
+                    it.removing = Some(now);
                 }
-                !(clear && matches!(i.status, Status::Done | Status::Failed(_) | Status::Canceled))
-            });
+            }
+            items.retain(|i| i.removing.map_or(true, |t| now - t < 0.25));
         }
     }
 }
