@@ -1094,23 +1094,36 @@ impl eframe::App for App {
         let n_active = snapshot.iter().filter(|i| matches!(i.status, Status::Queued | Status::Running)).count();
         let side_fill = mix(ctx.style().visuals.panel_fill, Color32::BLACK, 0.18);
         egui::SidePanel::left("nav")
-            .exact_width(128.0)
+            .exact_width(204.0)
             .resizable(false)
-            .frame(egui::Frame::none().fill(side_fill).inner_margin(egui::Margin::symmetric(12.0, 14.0)))
+            .frame(egui::Frame::none().fill(side_fill).inner_margin(egui::Margin::symmetric(14.0, 16.0)))
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("⬇ Grab").size(24.0).b().color(accent));
+                    ui.label(RichText::new("🌐 Grab").size(25.0).b().color(accent));
+                    ui.label(RichText::new("DOWNLOAD MANAGER").size(9.0).strong().weak());
                 });
-                ui.add_space(18.0);
+                ui.add_space(22.0);
+                ui.label(RichText::new("БІБЛІОТЕКА").size(10.0).strong().weak());
+                ui.add_space(7.0);
                 let q_label = if n_active > 0 { format!("Черга ({n_active})") } else { "Черга".to_string() };
                 for (t, icon, label) in [
-                    (Tab::Queue, "⬇", q_label),
-                    (Tab::History, "🕘", "Історія".to_string()),
+                    (Tab::Queue, "▤", q_label),
+                    (Tab::History, "◷", "Завершені".to_string()),
                     (Tab::Settings, "⚙", "Налаштування".to_string()),
                 ] {
                     if nav_item(ui, icon, &label, self.tab == t, accent).clicked() { self.tab = t; }
-                    ui.add_space(4.0);
+                    ui.add_space(5.0);
                 }
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(12.0);
+                ui.label(RichText::new("ЗБЕРЕЖЕННЯ").size(10.0).strong().weak());
+                ui.add_space(7.0);
+                ui.label(RichText::new("📁  Папка завантажень").size(12.0));
+                ui.label(RichText::new(self.s.out_dir.as_str()).size(10.0).weak().italics());
+                ui.add_space(10.0);
+                ui.label(RichText::new("ФОРМАТ").size(10.0).strong().weak());
+                ui.label(RichText::new(if self.s.mode == Mode::Video { format!("Відео · {}p", self.s.quality) } else { format!("Аудіо · {}", self.s.audio_fmt) }).size(12.0).color(accent));
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     ui.label(RichText::new(format!("v{VERSION}")).monospace().size(11.0).weak());
                     ui.add_space(6.0);
@@ -1238,22 +1251,42 @@ impl eframe::App for App {
                         });
                     }
 
-                    // заголовок
+                    // Заголовок у стилі IDM
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(RichText::new("Центр завантажень").size(28.0).b());
-                            ui.label(RichText::new("Активні, завершені та невдалі завантаження в одному місці").weak());
+                            ui.label(RichText::new("Усі завантаження").size(25.0).strong());
+                            ui.label(RichText::new("Керування файлами та активними завантаженнями").size(12.0).weak());
                         });
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-                            if soft_button(ui, "🗑 Очистити завершені", 34.0).clicked() { clear = true; }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if soft_button(ui, "⋯  Дії", 34.0).clicked() { self.tab = Tab::Settings; }
                         });
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(12.0);
+                    egui::Frame::none().fill(mix(base, text_col, 0.045)).stroke(Stroke::new(1.0, card_border)).rounding(12.0).inner_margin(egui::Margin::symmetric(10.0, 8.0)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if color_button(ui, "＋  Додати URL", accent, 36.0).clicked() { paste_add = true; }
+                            ui.separator();
+                            if soft_button(ui, "▶  Продовжити", 34.0).clicked() {
+                                for it in &snapshot { if it.status == Status::Paused { resume_ids.push(it.id); } }
+                            }
+                            if soft_button(ui, "Ⅱ  Пауза", 34.0).clicked() {
+                                for it in &snapshot { if it.status == Status::Running { pause_ids.push(it.id); } }
+                            }
+                            if soft_button(ui, "■  Стоп", 34.0).clicked() {
+                                for it in &snapshot { if matches!(it.status, Status::Running | Status::Queued) { cancel_ids.push(it.id); } }
+                            }
+                            if soft_button(ui, "🗑", 34.0).clicked() { clear = true; }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(format!("{} файлів", snapshot.len())).weak().size(11.0));
+                            });
+                        });
+                    });
+                    ui.add_space(10.0);
 
                     ui.add(
                         egui::TextEdit::multiline(&mut self.input)
                             .hint_text("🔗 Встав посилання на відео або плейлист (кожне з нового рядка) — або перетягни сюди .txt")
-                            .desired_rows(2)
+                            .desired_rows(1)
                             .desired_width(f32::INFINITY),
                     );
                     ui.horizontal(|ui| {
