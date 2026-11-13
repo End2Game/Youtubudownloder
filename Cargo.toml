@@ -1,0 +1,18 @@
+[package]
+name = "grab"
+version = "0.2.0"
+edition = "2021"
+description = "Простий завантажувач відео та музики (GUI на egui, обгортка над yt-dlp + ffmpeg)"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.29", features = ["persistence"] }
+serde = { version = "1", features = ["derive"] }
+rfd = "0.15"
+ureq = "2"
+arboard = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
