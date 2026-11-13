@@ -6,7 +6,9 @@ use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum Theme { Dark, Light, Midnight, Forest }
@@ -28,6 +30,7 @@ struct Settings {
     subs: bool,
     thumb: bool,
     limit: String,
+    auto_update: bool,
 }
 
 impl Default for Settings {
@@ -44,6 +47,7 @@ impl Default for Settings {
             subs: false,
             thumb: true,
             limit: String::new(),
+            auto_update: true,
         }
     }
 }
@@ -62,6 +66,7 @@ struct Item {
     speed_bps: f64,
     eta: String,
     size: String,
+    tag: String,
     child: Option<Arc<Mutex<Child>>>,
     cancel: bool,
 }
@@ -358,6 +363,145 @@ fn run_download(id: u64, url: String, s: Settings, items: Shared, ctx: egui::Con
     ctx.request_repaint();
 }
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const REPO: &str = "End2Game/Youtubudownloder";
+const ACCENTS: [[u8; 3]; 5] = [[90, 140, 255], [229, 87, 155], [62, 194, 143], [245, 166, 35], [160, 110, 255]];
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab { Queue, History, Settings }
+
+#[derive(Clone, Serialize, Deserialize)]
+struct HistEntry { title: String, url: String, tag: String }
+
+#[derive(Clone)]
+enum UpStage {
+    Idle,
+    Checking,
+    UpToDate,
+    CheckFailed(String),
+    Available { ver: String, url: String },
+    Downloading(f32),
+    Failed(String),
+    Closing,
+}
+type UpState = Arc<Mutex<UpStage>>;
+
+fn asset_name() -> Option<&'static str> {
+    if cfg!(all(windows, target_arch = "x86_64")) {
+        Some("grab-windows-x64.exe")
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("grab-linux-x64")
+    } else {
+        None
+    }
+}
+
+fn parse_ver(s: &str) -> Vec<u32> {
+    let mut v: Vec<u32> = s
+        .trim()
+        .trim_start_matches(|c| c == 'v' || c == 'V')
+        .split('.')
+        .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0))
+        .collect();
+    while v.len() < 3 { v.push(0); }
+    v
+}
+
+fn is_newer(remote: &str, local: &str) -> bool {
+    parse_ver(remote) > parse_ver(local)
+}
+
+/// Видаляє залишок старої версії після оновлення
+fn cleanup_old_exe() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::fs::remove_file(exe.with_extension("old"));
+        let _ = std::fs::remove_file(exe.with_extension("new"));
+    }
+}
+
+fn check_update(st: UpState, ctx: egui::Context) {
+    let Some(asset) = asset_name() else { return };
+    *st.lock().unwrap() = UpStage::Checking;
+    std::thread::spawn(move || {
+        let res = (|| -> Result<Option<(String, String)>, String> {
+            let body = ureq::get(&format!("https://api.github.com/repos/{REPO}/releases/latest"))
+                .set("User-Agent", "grab-updater")
+                .set("Accept", "application/vnd.github+json")
+                .timeout(Duration::from_secs(15))
+                .call()
+                .map_err(|e| e.to_string())?
+                .into_string()
+                .map_err(|e| e.to_string())?;
+            let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            let tag = v["tag_name"].as_str().unwrap_or("").to_string();
+            if !is_newer(&tag, VERSION) {
+                return Ok(None);
+            }
+            let url = v["assets"]
+                .as_array()
+                .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(asset)))
+                .and_then(|x| x["browser_download_url"].as_str())
+                .map(String::from)
+                .ok_or_else(|| "У релізі ще немає файлу для цієї системи".to_string())?;
+            Ok(Some((tag, url)))
+        })();
+        *st.lock().unwrap() = match res {
+            Ok(Some((ver, url))) => UpStage::Available { ver, url },
+            Ok(None) => UpStage::UpToDate,
+            Err(e) => UpStage::CheckFailed(e),
+        };
+        ctx.request_repaint();
+    });
+}
+
+fn install_update(st: UpState, ctx: egui::Context, url: String) {
+    std::thread::spawn(move || {
+        let res = (|| -> Result<(), String> {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            let new = exe.with_extension("new");
+            let old = exe.with_extension("old");
+            let resp = ureq::get(&url)
+                .set("User-Agent", "grab-updater")
+                .call()
+                .map_err(|e| format!("Не вдалося завантажити оновлення: {e}"))?;
+            let total: f32 = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            let mut reader = resp.into_reader();
+            let mut f = std::fs::File::create(&new).map_err(|e| format!("Не вдалося записати файл: {e}"))?;
+            let mut buf = [0u8; 65536];
+            let mut got = 0f32;
+            loop {
+                let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+                if n == 0 { break; }
+                f.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                got += n as f32;
+                if total > 0.0 {
+                    *st.lock().unwrap() = UpStage::Downloading((got / total).min(1.0));
+                    ctx.request_repaint();
+                }
+            }
+            drop(f);
+            if got < 1_000_000.0 {
+                let _ = std::fs::remove_file(&new);
+                return Err("Файл оновлення пошкоджений або неповний".to_string());
+            }
+            make_exec(&new);
+            let _ = std::fs::remove_file(&old);
+            std::fs::rename(&exe, &old).map_err(|e| format!("Не вдалося замінити програму: {e}"))?;
+            if let Err(e) = std::fs::rename(&new, &exe) {
+                let _ = std::fs::rename(&old, &exe);
+                return Err(format!("Не вдалося замінити програму: {e}"));
+            }
+            Command::new(&exe).spawn().map_err(|e| format!("Не вдалося перезапустити: {e}"))?;
+            Ok(())
+        })();
+        *st.lock().unwrap() = match res {
+            Ok(()) => UpStage::Closing,
+            Err(e) => UpStage::Failed(e),
+        };
+        ctx.request_repaint();
+    });
+}
+
 struct App {
     s: Settings,
     input: String,
@@ -366,11 +510,19 @@ struct App {
     ytdlp_ok: bool,
     ffmpeg_ok: bool,
     install: InstallState,
+    tab: Tab,
+    history: Vec<HistEntry>,
+    recorded: HashSet<u64>,
+    up: UpState,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let s = cc.storage.and_then(|st| eframe::get_value(st, "settings")).unwrap_or_default();
+        let s: Settings = cc.storage.and_then(|st| eframe::get_value(st, "settings")).unwrap_or_default();
+        let history: Vec<HistEntry> = cc.storage.and_then(|st| eframe::get_value(st, "history")).unwrap_or_default();
+        cleanup_old_exe();
+        let up: UpState = Arc::new(Mutex::new(UpStage::Idle));
+        check_update(up.clone(), cc.egui_ctx.clone());
         let ytdlp_ok = has_tool(ytdlp_path());
         let ffmpeg_ok = ffmpeg_dir().is_some() || has_tool("ffmpeg");
         let install: InstallState = Arc::new(Mutex::new(Install::default()));
@@ -385,6 +537,10 @@ impl App {
             ytdlp_ok,
             ffmpeg_ok,
             install,
+            tab: Tab::Queue,
+            history,
+            recorded: HashSet::new(),
+            up,
         }
     }
 
@@ -451,12 +607,16 @@ impl App {
     }
 
     fn add_urls(&mut self) {
+        let tag = match self.s.mode {
+            Mode::Video => format!("MP4 {}p", self.s.quality),
+            Mode::Audio => self.s.audio_fmt.to_uppercase(),
+        };
         let mut items = self.items.lock().unwrap();
         for line in self.input.lines().map(str::trim).filter(|l| !l.is_empty()) {
             items.push(Item {
                 id: self.next_id, url: line.to_string(), title: String::new(), status: Status::Queued,
                 percent: 0.0, speed: String::new(), speed_bps: 0.0, eta: String::new(),
-                size: String::new(), child: None, cancel: false,
+                size: String::new(), tag: tag.clone(), child: None, cancel: false,
             });
             self.next_id += 1;
         }
@@ -518,6 +678,16 @@ fn soft_button(ui: &mut egui::Ui, label: &str, height: f32) -> egui::Response {
     ui.add(egui::Button::new(label).min_size(egui::vec2(0.0, height)))
 }
 
+fn chip(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
+    ui.add(egui::Button::new(label).selected(on).rounding(14.0).min_size(egui::vec2(0.0, 28.0)))
+}
+
+fn icon_btn(ui: &mut egui::Ui, icon: &str, tip: &str, color: Option<Color32>) -> egui::Response {
+    let mut t = RichText::new(icon).size(15.0);
+    if let Some(c) = color { t = t.color(c); }
+    ui.add(egui::Button::new(t).min_size(egui::vec2(32.0, 32.0))).on_hover_text(tip)
+}
+
 fn section(ui: &mut egui::Ui, accent: Color32, text: &str) {
     ui.add_space(6.0);
     ui.label(RichText::new(text.to_uppercase()).small().strong().color(accent));
@@ -537,6 +707,7 @@ fn open_folder(path: &str) {
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "settings", &self.s);
+        eframe::set_value(storage, "history", &self.history);
     }
 
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
@@ -548,105 +719,81 @@ impl eframe::App for App {
         self.apply_theme(ctx);
         self.start_queued(ctx);
         let accent = self.accent();
+        let green = Color32::from_rgb(80, 200, 120);
+        let red = Color32::from_rgb(230, 80, 80);
         let snapshot: Vec<Item> = self.items.lock().unwrap().clone();
 
-        let side_frame = egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::same(14.0));
-        egui::SidePanel::left("settings").default_width(280.0).min_width(260.0).frame(side_frame).show(ctx, |ui| {
-            ui.label(RichText::new("⬇ Grab").size(28.0).strong().color(accent));
-            ui.label(RichText::new("Налаштування").weak());
-            ui.separator();
-
-            section(ui, accent, "Вигляд");
-            egui::ComboBox::from_label("Тема")
-                .selected_text(match self.s.theme {
-                    Theme::Dark => "Темна", Theme::Light => "Світла",
-                    Theme::Midnight => "Опівніч", Theme::Forest => "Ліс",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.s.theme, Theme::Dark, "Темна");
-                    ui.selectable_value(&mut self.s.theme, Theme::Light, "Світла");
-                    ui.selectable_value(&mut self.s.theme, Theme::Midnight, "Опівніч");
-                    ui.selectable_value(&mut self.s.theme, Theme::Forest, "Ліс");
-                });
-            ui.horizontal(|ui| {
-                ui.color_edit_button_srgb(&mut self.s.accent);
-                ui.label("Акцентний колір");
-            });
-            ui.separator();
-
-            section(ui, accent, "Завантаження");
-            ui.horizontal(|ui| {
-                let video = self.s.mode == Mode::Video;
-                let b1 = egui::Button::new("🎬 Відео").selected(video)
-                    .rounding(8.0).min_size(egui::vec2(110.0, 34.0));
-                if ui.add(b1).clicked() { self.s.mode = Mode::Video; }
-                let b2 = egui::Button::new("🎵 Музика").selected(!video)
-                    .rounding(8.0).min_size(egui::vec2(110.0, 34.0));
-                if ui.add(b2).clicked() { self.s.mode = Mode::Audio; }
-            });
-            if self.s.mode == Mode::Video {
-                egui::ComboBox::from_label("Якість")
-                    .selected_text(format!("до {}p", self.s.quality))
-                    .show_ui(ui, |ui| {
-                        for q in [360, 480, 720, 1080, 1440, 2160] {
-                            ui.selectable_value(&mut self.s.quality, q, format!("до {q}p"));
-                        }
-                    });
-            } else {
-                egui::ComboBox::from_label("Формат")
-                    .selected_text(self.s.audio_fmt.clone())
-                    .show_ui(ui, |ui| {
-                        for f in ["mp3", "m4a", "opus", "flac", "wav"] {
-                            ui.selectable_value(&mut self.s.audio_fmt, f.to_string(), f);
-                        }
-                    });
+        // історія завершених завантажень
+        for it in &snapshot {
+            if it.status == Status::Done && self.recorded.insert(it.id) {
+                let title = if it.title.is_empty() { it.url.clone() } else { it.title.clone() };
+                self.history.insert(0, HistEntry { title, url: it.url.clone(), tag: it.tag.clone() });
             }
-            ui.add(egui::Slider::new(&mut self.s.max_parallel, 1..=6).text("Одночасно"));
-            ui.horizontal(|ui| {
-                ui.label("Ліміт швидкості");
-                ui.add(egui::TextEdit::singleline(&mut self.s.limit).hint_text("напр. 2M").desired_width(80.0));
-            });
-            ui.separator();
+        }
+        self.history.truncate(100);
 
-            section(ui, accent, "Опції");
-            ui.checkbox(&mut self.s.playlist, "Весь плейлист");
-            ui.checkbox(&mut self.s.subs, "Субтитри (uk/ru/en)");
-            ui.checkbox(&mut self.s.thumb, "Обкладинка у файл");
-            ui.separator();
+        // автооновлення
+        let stage = self.up.lock().unwrap().clone();
+        let busy = snapshot.iter().any(|i| matches!(i.status, Status::Running | Status::Queued));
+        let mut start_up: Option<String> = None;
+        if let UpStage::Available { url, .. } = &stage {
+            if self.s.auto_update && !busy {
+                start_up = Some(url.clone());
+            }
+        }
+        if matches!(stage, UpStage::Closing) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
-            section(ui, accent, "Папка збереження");
-            ui.add(egui::TextEdit::singleline(&mut self.s.out_dir).desired_width(f32::INFINITY));
+        // ---- верхня панель: логотип, вкладки, кольори ----
+        let top_frame = egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(16.0, 10.0));
+        egui::TopBottomPanel::top("top").frame(top_frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if soft_button(ui, "📁 Обрати...", 32.0).clicked() {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                        self.s.out_dir = p.display().to_string();
+                ui.label(RichText::new("⬇ Grab").size(22.0).strong().color(accent));
+                ui.add_space(12.0);
+                let n_active = snapshot.iter().filter(|i| matches!(i.status, Status::Queued | Status::Running)).count();
+                let q_label = if n_active > 0 { format!("📋 Черга ({n_active})") } else { "📋 Черга".to_string() };
+                let tabs = [
+                    (Tab::Queue, q_label),
+                    (Tab::History, "🕘 Історія".to_string()),
+                    (Tab::Settings, "⚙ Налаштування".to_string()),
+                ];
+                for (t, label) in tabs {
+                    let b = egui::Button::new(label).selected(self.tab == t).rounding(8.0).min_size(egui::vec2(0.0, 32.0));
+                    if ui.add(b).clicked() { self.tab = t; }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let ring = ui.visuals().text_color();
+                    for c in ACCENTS.iter().rev() {
+                        let col = Color32::from_rgb(c[0], c[1], c[2]);
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                        ui.painter().circle_filled(rect.center(), 8.0, col);
+                        if self.s.accent == *c {
+                            ui.painter().circle_stroke(rect.center(), 10.0, Stroke::new(2.0, ring));
+                        }
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            self.s.accent = *c;
+                        }
                     }
-                }
-                if soft_button(ui, "📂 Відкрити", 32.0).clicked() {
-                    open_folder(&self.s.out_dir);
-                }
+                });
             });
-            ui.separator();
-
-            if soft_button(ui, "🔄 Оновити yt-dlp", 32.0).clicked() {
-                std::thread::spawn(|| { let _ = tool_cmd(ytdlp_path()).arg("-U").output(); });
-            }
         });
 
+        // ---- нижня панель: статистика ----
         egui::TopBottomPanel::bottom("stats").show(ctx, |ui| {
             let active = snapshot.iter().filter(|i| i.status == Status::Running).count();
             let queued = snapshot.iter().filter(|i| i.status == Status::Queued).count();
             let done = snapshot.iter().filter(|i| i.status == Status::Done).count();
             let failed = snapshot.iter().filter(|i| matches!(i.status, Status::Failed(_))).count();
             let total: f64 = snapshot.iter().map(|i| i.speed_bps).sum();
+            let weak = ui.visuals().weak_text_color();
             ui.horizontal(|ui| {
-                let green = Color32::from_rgb(80, 200, 120);
-                let red = Color32::from_rgb(230, 80, 80);
-                ui.label(RichText::new(format!("▶ Активні: {active}")).color(if active > 0 { accent } else { ui.visuals().weak_text_color() }));
+                ui.label(RichText::new(format!("▶ Активні: {active}")).color(if active > 0 { accent } else { weak }));
                 ui.label(format!("⏳ У черзі: {queued}"));
-                ui.label(RichText::new(format!("✔ Готово: {done}")).color(if done > 0 { green } else { ui.visuals().weak_text_color() }));
-                ui.label(RichText::new(format!("⚠ Помилок: {failed}")).color(if failed > 0 { red } else { ui.visuals().weak_text_color() }));
+                ui.label(RichText::new(format!("✔ Готово: {done}")).color(if done > 0 { green } else { weak }));
+                ui.label(RichText::new(format!("⚠ Помилок: {failed}")).color(if failed > 0 { red } else { weak }));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(format!("v{VERSION}")).small().color(weak));
                     ui.label(RichText::new(format!("Загальна швидкість: {}", fmt_speed(total))).color(accent));
                 });
             });
@@ -654,99 +801,299 @@ impl eframe::App for App {
 
         let mut cancel_ids = Vec::new();
         let mut remove_ids = Vec::new();
+        let mut redo_urls: Vec<String> = Vec::new();
         let mut add = false;
         let mut clear = false;
         let mut start_inst = false;
         let mut paste = false;
+        let mut paste_add = false;
+        let mut recheck = false;
+        let out_dir = self.s.out_dir.clone();
 
+        // ---- центральна панель ----
         let central_frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(18.0));
         egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
-            ui.label(RichText::new("Завантажувач відео та музики").size(24.0).strong());
-            if !self.ytdlp_ok || !self.ffmpeg_ok {
-                let (busy, msg, prog, err) = {
-                    let i = self.install.lock().unwrap();
-                    (i.busy, i.msg.clone(), i.progress, i.err.clone())
-                };
-                egui::Frame::group(ui.style()).rounding(10.0).inner_margin(12.0).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(RichText::new("⚙ Потрібні компоненти: yt-dlp та ffmpeg").strong());
-                    if busy {
-                        ui.add(egui::ProgressBar::new(prog).show_percentage().fill(accent).desired_height(14.0).animate(true));
-                        ui.label(msg);
-                    } else {
-                        if let Some(e) = err { ui.colored_label(Color32::from_rgb(230, 80, 80), e); }
-                        if color_button(ui, "⬇ Встановити автоматично", accent, 34.0).clicked() { start_inst = true; }
-                    }
-                });
-            }
-            ui.label(RichText::new("Встав посилання — кожне з нового рядка").weak());
-            ui.add(
-                egui::TextEdit::multiline(&mut self.input)
-                    .hint_text("https://www.youtube.com/watch?v=...")
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.horizontal(|ui| {
-                if color_button(ui, "➕ Додати в чергу", accent, 34.0).clicked() { add = true; }
-                if soft_button(ui, "📋 Вставити з буфера", 34.0).clicked() { paste = true; }
-                if soft_button(ui, "🗑 Очистити завершені", 34.0).clicked() { clear = true; }
-            });
-            ui.add_space(4.0);
-            ui.separator();
+            let base = ui.visuals().panel_fill;
+            let text_col = ui.visuals().text_color();
+            let card_fill = mix(base, text_col, 0.05);
+            let card_border = mix(base, text_col, 0.10);
 
-            if snapshot.is_empty() {
-                ui.add_space(40.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("⬇").size(48.0).color(accent));
-                    ui.label(RichText::new("Черга порожня").size(18.0).strong());
-                    ui.label(RichText::new("Встав посилання вище й натисни «Додати в чергу»").weak());
-                });
-            }
-
-            let card_fill = mix(ui.visuals().panel_fill, ui.visuals().text_color(), 0.05);
-            let card_border = mix(ui.visuals().panel_fill, ui.visuals().text_color(), 0.10);
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for it in &snapshot {
+            // банер оновлення програми
+            match &stage {
+                UpStage::Available { ver, url } => {
                     egui::Frame::none()
-                        .fill(card_fill)
-                        .stroke(Stroke::new(1.0, card_border))
+                        .fill(mix(base, accent, 0.18))
+                        .stroke(Stroke::new(1.0, accent))
                         .rounding(10.0)
-                        .inner_margin(12.0)
+                        .inner_margin(10.0)
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            let name = if it.title.is_empty() { &it.url } else { &it.title };
-                            ui.label(RichText::new(name).strong());
-                            ui.add(
-                                egui::ProgressBar::new(it.percent / 100.0)
-                                    .show_percentage()
-                                    .fill(accent)
-                                    .desired_height(14.0)
-                                    .animate(it.status == Status::Running),
-                            );
                             ui.horizontal(|ui| {
-                                match &it.status {
-                                    Status::Queued => { ui.label(RichText::new("⏳ У черзі").weak()); }
-                                    Status::Running => {
-                                        ui.label(RichText::new(format!("{}  •  {}  •  ETA {}", it.speed, it.size, it.eta)).color(accent));
-                                    }
-                                    Status::Done => { ui.colored_label(Color32::from_rgb(80, 200, 120), "✔ Готово"); }
-                                    Status::Canceled => { ui.label(RichText::new("✖ Скасовано").weak()); }
-                                    Status::Failed(e) => { ui.colored_label(Color32::from_rgb(230, 80, 80), format!("⚠ {e}")); }
-                                }
+                                ui.label(RichText::new(format!("🚀 Доступна нова версія {ver}")).strong());
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if soft_button(ui, "🗑 Видалити", 28.0).clicked() { remove_ids.push(it.id); }
-                                    if matches!(it.status, Status::Queued | Status::Running)
-                                        && color_button(ui, "✖ Скасувати", Color32::from_rgb(205, 75, 75), 28.0).clicked()
-                                    { cancel_ids.push(it.id); }
+                                    if color_button(ui, "⬇ Оновити й перезапустити", accent, 32.0).clicked() {
+                                        start_up = Some(url.clone());
+                                    }
                                 });
                             });
                         });
-                    ui.add_space(2.0);
+                    ui.add_space(6.0);
                 }
-            });
+                UpStage::Downloading(p) => {
+                    egui::Frame::none()
+                        .fill(mix(base, accent, 0.18))
+                        .stroke(Stroke::new(1.0, accent))
+                        .rounding(10.0)
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new("🚀 Оновлення програми…").strong());
+                            ui.add(egui::ProgressBar::new(*p).show_percentage().fill(accent).desired_height(12.0).animate(true));
+                        });
+                    ui.add_space(6.0);
+                }
+                UpStage::Failed(e) => {
+                    ui.colored_label(red, format!("⚠ Оновлення не вдалося: {e}"));
+                }
+                _ => {}
+            }
+
+            match self.tab {
+                Tab::Queue => {
+                    if !self.ytdlp_ok || !self.ffmpeg_ok {
+                        let (busy_i, msg, prog, err) = {
+                            let i = self.install.lock().unwrap();
+                            (i.busy, i.msg.clone(), i.progress, i.err.clone())
+                        };
+                        egui::Frame::group(ui.style()).rounding(10.0).inner_margin(12.0).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new("⚙ Потрібні компоненти: yt-dlp та ffmpeg").strong());
+                            if busy_i {
+                                ui.add(egui::ProgressBar::new(prog).show_percentage().fill(accent).desired_height(14.0).animate(true));
+                                ui.label(msg);
+                            } else {
+                                if let Some(e) = err { ui.colored_label(red, e); }
+                                if color_button(ui, "⬇ Встановити автоматично", accent, 34.0).clicked() { start_inst = true; }
+                            }
+                        });
+                    }
+
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.input)
+                            .hint_text("🔗 Встав посилання на відео або плейлист (кожне з нового рядка)")
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.horizontal(|ui| {
+                        if color_button(ui, "📋 Вставити й качати", accent, 38.0).clicked() { paste_add = true; }
+                        if soft_button(ui, "➕ Додати в чергу", 38.0).clicked() { add = true; }
+                        if soft_button(ui, "🗑 Очистити завершені", 38.0).clicked() { clear = true; }
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        let video = self.s.mode == Mode::Video;
+                        let b1 = egui::Button::new("🎬 Відео").selected(video).rounding(8.0).min_size(egui::vec2(100.0, 32.0));
+                        if ui.add(b1).clicked() { self.s.mode = Mode::Video; }
+                        let b2 = egui::Button::new("🎵 Музика").selected(!video).rounding(8.0).min_size(egui::vec2(100.0, 32.0));
+                        if ui.add(b2).clicked() { self.s.mode = Mode::Audio; }
+                        ui.add_space(8.0);
+                        if video {
+                            for (q, l) in [(480u32, "480p"), (720, "720p"), (1080, "1080p"), (1440, "1440p"), (2160, "4K")] {
+                                if chip(ui, l, self.s.quality == q).clicked() { self.s.quality = q; }
+                            }
+                        } else {
+                            for f in ["mp3", "m4a", "opus", "flac", "wav"] {
+                                if chip(ui, f, self.s.audio_fmt == f).clicked() { self.s.audio_fmt = f.to_string(); }
+                            }
+                        }
+                        ui.add_space(8.0);
+                        if chip(ui, "📃 Плейлист", self.s.playlist).clicked() { self.s.playlist = !self.s.playlist; }
+                        if video && chip(ui, "💬 Субтитри", self.s.subs).clicked() { self.s.subs = !self.s.subs; }
+                        if chip(ui, "🖼 Обкладинка", self.s.thumb).clicked() { self.s.thumb = !self.s.thumb; }
+                    });
+                    ui.add_space(4.0);
+                    ui.separator();
+
+                    if snapshot.is_empty() {
+                        ui.add_space(40.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("⬇").size(48.0).color(accent));
+                            ui.label(RichText::new("Черга порожня").size(18.0).strong());
+                            ui.label(RichText::new("Встав посилання вище й натисни «Вставити й качати»").weak());
+                        });
+                    }
+
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        for it in &snapshot {
+                            egui::Frame::none()
+                                .fill(card_fill)
+                                .stroke(Stroke::new(1.0, card_border))
+                                .rounding(12.0)
+                                .inner_margin(10.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        // мініатюра-іконка
+                                        let video = it.tag.starts_with("MP4");
+                                        let tint = if it.status == Status::Done { green } else if video { accent } else { Color32::from_rgb(62, 194, 143) };
+                                        let icon = if it.status == Status::Done { "✔" } else if video { "▶" } else { "🎵" };
+                                        let (rect, _) = ui.allocate_exact_size(egui::vec2(88.0, 54.0), egui::Sense::hover());
+                                        ui.painter().rect_filled(rect, 10.0, mix(card_fill, tint, 0.25));
+                                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, FontId::proportional(22.0), tint);
+
+                                        // назва, прогрес, статус
+                                        let col_w = (ui.available_width() - 120.0).max(150.0);
+                                        ui.vertical(|ui| {
+                                            ui.set_width(col_w);
+                                            let name = if it.title.is_empty() { &it.url } else { &it.title };
+                                            ui.label(RichText::new(name).strong());
+                                            if it.status != Status::Done {
+                                                ui.add(
+                                                    egui::ProgressBar::new(it.percent / 100.0)
+                                                        .fill(accent)
+                                                        .desired_height(8.0)
+                                                        .animate(it.status == Status::Running),
+                                                );
+                                            }
+                                            let st: RichText = match &it.status {
+                                                Status::Queued => RichText::new(format!("{}  •  ⏳ У черзі", it.tag)).weak(),
+                                                Status::Running => {
+                                                    if it.speed.is_empty() {
+                                                        RichText::new(format!("{}  •  Підготовка…", it.tag)).color(accent)
+                                                    } else {
+                                                        RichText::new(format!("{}  •  {:.0}%  •  {}  •  {}  •  ETA {}", it.tag, it.percent, it.speed, it.size, it.eta)).color(accent)
+                                                    }
+                                                }
+                                                Status::Done => RichText::new(format!("{}  •  ✔ Готово", it.tag)).color(green),
+                                                Status::Canceled => RichText::new("✖ Скасовано").weak(),
+                                                Status::Failed(e) => RichText::new(format!("⚠ {e}")).color(red),
+                                            };
+                                            ui.label(st);
+                                        });
+
+                                        // кнопки дій
+                                        ui.horizontal(|ui| {
+                                            if it.status == Status::Done && icon_btn(ui, "📂", "Відкрити папку", None).clicked() {
+                                                open_folder(&out_dir);
+                                            }
+                                            if matches!(it.status, Status::Queued | Status::Running)
+                                                && icon_btn(ui, "✖", "Скасувати", Some(red)).clicked()
+                                            {
+                                                cancel_ids.push(it.id);
+                                            }
+                                            if icon_btn(ui, "🗑", "Видалити", None).clicked() { remove_ids.push(it.id); }
+                                        });
+                                    });
+                                });
+                            ui.add_space(2.0);
+                        }
+                    });
+                }
+
+                Tab::History => {
+                    ui.label(RichText::new("Історія завантажень").size(22.0).strong());
+                    if self.history.is_empty() {
+                        ui.add_space(40.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("🕘").size(48.0).color(accent));
+                            ui.label(RichText::new("Тут з'являться завершені завантаження").weak());
+                        });
+                    } else {
+                        if soft_button(ui, "🗑 Очистити історію", 32.0).clicked() { self.history.clear(); }
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            for h in &self.history {
+                                egui::Frame::none()
+                                    .fill(card_fill)
+                                    .stroke(Stroke::new(1.0, card_border))
+                                    .rounding(12.0)
+                                    .inner_margin(10.0)
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            let col_w = (ui.available_width() - 60.0).max(150.0);
+                                            ui.vertical(|ui| {
+                                                ui.set_width(col_w);
+                                                ui.label(RichText::new(&h.title).strong());
+                                                ui.label(RichText::new(format!("{}  •  {}", h.tag, h.url)).small().weak());
+                                            });
+                                            if icon_btn(ui, "🔁", "Завантажити ще раз", None).clicked() {
+                                                redo_urls.push(h.url.clone());
+                                            }
+                                        });
+                                    });
+                                ui.add_space(2.0);
+                            }
+                        });
+                    }
+                }
+
+                Tab::Settings => {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.label(RichText::new("Налаштування").size(22.0).strong());
+
+                        section(ui, accent, "Вигляд");
+                        egui::ComboBox::from_label("Тема")
+                            .selected_text(match self.s.theme {
+                                Theme::Dark => "Темна", Theme::Light => "Світла",
+                                Theme::Midnight => "Опівніч", Theme::Forest => "Ліс",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.s.theme, Theme::Dark, "Темна");
+                                ui.selectable_value(&mut self.s.theme, Theme::Light, "Світла");
+                                ui.selectable_value(&mut self.s.theme, Theme::Midnight, "Опівніч");
+                                ui.selectable_value(&mut self.s.theme, Theme::Forest, "Ліс");
+                            });
+                        ui.horizontal(|ui| {
+                            ui.color_edit_button_srgb(&mut self.s.accent);
+                            ui.label("Свій акцентний колір");
+                        });
+                        ui.separator();
+
+                        section(ui, accent, "Завантаження");
+                        ui.add(egui::Slider::new(&mut self.s.max_parallel, 1..=6).text("Одночасно"));
+                        ui.horizontal(|ui| {
+                            ui.label("Ліміт швидкості");
+                            ui.add(egui::TextEdit::singleline(&mut self.s.limit).hint_text("напр. 2M").desired_width(90.0));
+                        });
+                        ui.separator();
+
+                        section(ui, accent, "Папка збереження");
+                        ui.add(egui::TextEdit::singleline(&mut self.s.out_dir).desired_width(f32::INFINITY));
+                        ui.horizontal(|ui| {
+                            if soft_button(ui, "📁 Обрати...", 32.0).clicked() {
+                                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                    self.s.out_dir = p.display().to_string();
+                                }
+                            }
+                            if soft_button(ui, "📂 Відкрити", 32.0).clicked() {
+                                open_folder(&self.s.out_dir);
+                            }
+                        });
+                        ui.separator();
+
+                        section(ui, accent, "Оновлення");
+                        ui.checkbox(&mut self.s.auto_update, "Оновлювати програму автоматично");
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Поточна версія: v{VERSION}"));
+                            if soft_button(ui, "🔄 Перевірити оновлення", 32.0).clicked() { recheck = true; }
+                        });
+                        match &stage {
+                            UpStage::Checking => { ui.label(RichText::new("Перевіряю…").weak()); }
+                            UpStage::UpToDate => { ui.colored_label(green, "✔ У тебе остання версія"); }
+                            UpStage::CheckFailed(e) => { ui.label(RichText::new(format!("Не вдалося перевірити: {e}")).weak()); }
+                            UpStage::Available { ver, .. } => { ui.colored_label(accent, format!("Є нова версія: {ver}")); }
+                            _ => {}
+                        }
+                        if soft_button(ui, "🔄 Оновити yt-dlp", 32.0).clicked() {
+                            std::thread::spawn(|| { let _ = tool_cmd(ytdlp_path()).arg("-U").output(); });
+                        }
+                    });
+                }
+            }
         });
 
-        if paste {
+        if paste || paste_add {
             if let Ok(mut cb) = arboard::Clipboard::new() {
                 if let Ok(t) = cb.get_text() {
                     if !self.input.is_empty() && !self.input.ends_with('\n') { self.input.push('\n'); }
@@ -755,7 +1102,20 @@ impl eframe::App for App {
             }
         }
         if start_inst { start_install(self.install.clone(), ctx.clone()); }
-        if add { self.add_urls(); }
+        if recheck { check_update(self.up.clone(), ctx.clone()); }
+        if let Some(url) = start_up {
+            *self.up.lock().unwrap() = UpStage::Downloading(0.0);
+            install_update(self.up.clone(), ctx.clone(), url);
+        }
+        if !redo_urls.is_empty() {
+            for u in redo_urls {
+                if !self.input.is_empty() && !self.input.ends_with('\n') { self.input.push('\n'); }
+                self.input.push_str(&u);
+            }
+            add = true;
+            self.tab = Tab::Queue;
+        }
+        if add || paste_add { self.add_urls(); }
         {
             let mut items = self.items.lock().unwrap();
             for id in cancel_ids {
