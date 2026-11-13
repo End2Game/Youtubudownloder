@@ -47,10 +47,35 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches.Groups[1].Value
-          if ($env:GITHUB_REF.StartsWith('refs/tags/')) { $version = $env:GITHUB_REF_NAME.TrimStart('v') }
-          & "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "installer/Grab.iss"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "Не вдалося прочитати version з Cargo.toml" }
+          $version = $match.Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF.StartsWith('refs/tags/')) {
+            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          }
+
+          # Chocolatey може встановити ISCC.exe у різні стандартні каталоги.
+          $candidates = @(
+            (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
+            (Join-Path $env:ChocolateyInstall 'lib\innosetup\tools\ISCC.exe')
+          ) | Where-Object { $_ -and (Test-Path $_) }
+
+          $iscc = $candidates | Select-Object -First 1
+          if (-not $iscc) {
+            $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($command) { $iscc = $command.Source }
+          }
+          if (-not $iscc) {
+            throw "ISCC.exe не знайдено. Перевірте встановлення Inno Setup 6."
+          }
+
+          Write-Host "Building Grab installer v$version using $iscc"
+          & $iscc "/DAppVersion=$version" "installer/Grab.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup завершився з кодом $LASTEXITCODE" }
+          if (-not (Test-Path 'dist/Grab-Setup-x64.exe')) {
+            throw "Інсталятор не створено: dist/Grab-Setup-x64.exe не знайдено"
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
