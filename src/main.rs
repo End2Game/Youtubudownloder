@@ -1,6 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Rounding, Stroke, TextStyle};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -275,7 +275,7 @@ fn run_download(id: u64, url: String, s: Settings, items: Shared, ctx: egui::Con
     if !s.playlist {
         cmd.arg("--no-playlist");
     }
-    if s.subs {
+    if s.subs && s.mode == Mode::Video {
         cmd.args(["--write-subs", "--embed-subs", "--sub-langs", "uk,ru,en"]);
     }
     if !s.limit.trim().is_empty() {
@@ -287,7 +287,8 @@ fn run_download(id: u64, url: String, s: Settings, items: Shared, ctx: egui::Con
             cmd.args(["-f", &format!("bv*[height<={q}]+ba/b[height<={q}]"), "--merge-output-format", "mp4"]);
         }
         Mode::Audio => {
-            cmd.args(["-x", "--audio-format", &s.audio_fmt, "--audio-quality", "0"]);
+            // Лише аудіо-доріжка: відео взагалі не завантажується
+            cmd.args(["-f", "bestaudio/best", "-x", "--audio-format", &s.audio_fmt, "--audio-quality", "0"]);
         }
     }
     cmd.arg(&url).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -407,10 +408,46 @@ impl App {
             _ => {}
         }
         let a = self.accent();
+        let base = v.panel_fill;
+        let text = v.text_color();
+        let r = Rounding::same(8.0);
+
         v.selection.bg_fill = a;
+        v.selection.stroke = Stroke::new(1.0, on_color(a));
         v.hyperlink_color = a;
-        v.widgets.hovered.bg_stroke.color = a;
+        v.window_rounding = Rounding::same(12.0);
+        v.menu_rounding = Rounding::same(8.0);
+
+        for w in [
+            &mut v.widgets.noninteractive,
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+            &mut v.widgets.open,
+        ] {
+            w.rounding = r;
+        }
+        v.widgets.inactive.bg_fill = mix(base, text, 0.10);
+        v.widgets.inactive.weak_bg_fill = mix(base, text, 0.08);
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, mix(base, text, 0.12));
+        v.widgets.hovered.bg_fill = mix(base, a, 0.30);
+        v.widgets.hovered.weak_bg_fill = mix(base, a, 0.25);
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, a);
+        v.widgets.active.bg_fill = mix(base, a, 0.50);
+        v.widgets.active.weak_bg_fill = mix(base, a, 0.45);
+        v.widgets.active.bg_stroke = Stroke::new(1.0, a);
         ctx.set_visuals(v);
+
+        ctx.style_mut(|s| {
+            s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            s.spacing.button_padding = egui::vec2(12.0, 6.0);
+            s.spacing.interact_size.y = 30.0;
+            s.spacing.slider_width = 120.0;
+            s.text_styles.insert(TextStyle::Heading, FontId::new(22.0, FontFamily::Proportional));
+            s.text_styles.insert(TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
+            s.text_styles.insert(TextStyle::Button, FontId::new(15.0, FontFamily::Proportional));
+            s.text_styles.insert(TextStyle::Small, FontId::new(12.0, FontFamily::Proportional));
+        });
     }
 
     fn add_urls(&mut self) {
@@ -448,6 +485,44 @@ impl App {
     }
 }
 
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+/// Колір тексту, що добре читається на заданому фоні
+fn on_color(c: Color32) -> Color32 {
+    let lum = 0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32;
+    if lum > 150.0 { Color32::from_rgb(20, 22, 30) } else { Color32::WHITE }
+}
+
+/// Кольорова (залита) кнопка з ефектами наведення/натискання
+fn color_button(ui: &mut egui::Ui, label: &str, color: Color32, height: f32) -> egui::Response {
+    ui.scope(|ui| {
+        let fg = on_color(color);
+        let w = &mut ui.style_mut().visuals.widgets;
+        w.inactive.weak_bg_fill = color;
+        w.hovered.weak_bg_fill = mix(color, Color32::WHITE, 0.15);
+        w.active.weak_bg_fill = mix(color, Color32::BLACK, 0.15);
+        for st in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+            st.bg_stroke = Stroke::NONE;
+            st.fg_stroke.color = fg;
+        }
+        ui.add(egui::Button::new(RichText::new(label).strong()).min_size(egui::vec2(0.0, height)))
+    })
+    .inner
+}
+
+/// Звичайна (приглушена) кнопка
+fn soft_button(ui: &mut egui::Ui, label: &str, height: f32) -> egui::Response {
+    ui.add(egui::Button::new(label).min_size(egui::vec2(0.0, height)))
+}
+
+fn section(ui: &mut egui::Ui, accent: Color32, text: &str) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(text.to_uppercase()).small().strong().color(accent));
+}
+
 fn open_folder(path: &str) {
     let _ = std::fs::create_dir_all(path);
     #[cfg(target_os = "windows")]
@@ -475,9 +550,13 @@ impl eframe::App for App {
         let accent = self.accent();
         let snapshot: Vec<Item> = self.items.lock().unwrap().clone();
 
-        egui::SidePanel::left("settings").min_width(240.0).show(ctx, |ui| {
-            ui.heading("Налаштування");
+        let side_frame = egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin::same(14.0));
+        egui::SidePanel::left("settings").default_width(280.0).min_width(260.0).frame(side_frame).show(ctx, |ui| {
+            ui.label(RichText::new("⬇ Grab").size(28.0).strong().color(accent));
+            ui.label(RichText::new("Налаштування").weak());
             ui.separator();
+
+            section(ui, accent, "Вигляд");
             egui::ComboBox::from_label("Тема")
                 .selected_text(match self.s.theme {
                     Theme::Dark => "Темна", Theme::Light => "Світла",
@@ -494,9 +573,16 @@ impl eframe::App for App {
                 ui.label("Акцентний колір");
             });
             ui.separator();
+
+            section(ui, accent, "Завантаження");
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.s.mode, Mode::Video, "Відео");
-                ui.selectable_value(&mut self.s.mode, Mode::Audio, "Музика");
+                let video = self.s.mode == Mode::Video;
+                let b1 = egui::Button::new("🎬 Відео").selected(video)
+                    .rounding(8.0).min_size(egui::vec2(110.0, 34.0));
+                if ui.add(b1).clicked() { self.s.mode = Mode::Video; }
+                let b2 = egui::Button::new("🎵 Музика").selected(!video)
+                    .rounding(8.0).min_size(egui::vec2(110.0, 34.0));
+                if ui.add(b2).clicked() { self.s.mode = Mode::Audio; }
             });
             if self.s.mode == Mode::Video {
                 egui::ComboBox::from_label("Якість")
@@ -518,26 +604,31 @@ impl eframe::App for App {
             ui.add(egui::Slider::new(&mut self.s.max_parallel, 1..=6).text("Одночасно"));
             ui.horizontal(|ui| {
                 ui.label("Ліміт швидкості");
-                ui.add(egui::TextEdit::singleline(&mut self.s.limit).hint_text("напр. 2M").desired_width(70.0));
+                ui.add(egui::TextEdit::singleline(&mut self.s.limit).hint_text("напр. 2M").desired_width(80.0));
             });
+            ui.separator();
+
+            section(ui, accent, "Опції");
             ui.checkbox(&mut self.s.playlist, "Весь плейлист");
             ui.checkbox(&mut self.s.subs, "Субтитри (uk/ru/en)");
             ui.checkbox(&mut self.s.thumb, "Обкладинка у файл");
             ui.separator();
-            ui.label("Папка збереження");
-            ui.text_edit_singleline(&mut self.s.out_dir);
+
+            section(ui, accent, "Папка збереження");
+            ui.add(egui::TextEdit::singleline(&mut self.s.out_dir).desired_width(f32::INFINITY));
             ui.horizontal(|ui| {
-                if ui.button("Обрати...").clicked() {
+                if soft_button(ui, "📁 Обрати...", 32.0).clicked() {
                     if let Some(p) = rfd::FileDialog::new().pick_folder() {
                         self.s.out_dir = p.display().to_string();
                     }
                 }
-                if ui.button("Відкрити").clicked() {
+                if soft_button(ui, "📂 Відкрити", 32.0).clicked() {
                     open_folder(&self.s.out_dir);
                 }
             });
             ui.separator();
-            if ui.button("Оновити yt-dlp").clicked() {
+
+            if soft_button(ui, "🔄 Оновити yt-dlp", 32.0).clicked() {
                 std::thread::spawn(|| { let _ = tool_cmd(ytdlp_path()).arg("-U").output(); });
             }
         });
@@ -549,10 +640,12 @@ impl eframe::App for App {
             let failed = snapshot.iter().filter(|i| matches!(i.status, Status::Failed(_))).count();
             let total: f64 = snapshot.iter().map(|i| i.speed_bps).sum();
             ui.horizontal(|ui| {
-                ui.label(format!("Активні: {active}"));
-                ui.label(format!("У черзі: {queued}"));
-                ui.label(format!("Готово: {done}"));
-                ui.label(format!("Помилок: {failed}"));
+                let green = Color32::from_rgb(80, 200, 120);
+                let red = Color32::from_rgb(230, 80, 80);
+                ui.label(RichText::new(format!("▶ Активні: {active}")).color(if active > 0 { accent } else { ui.visuals().weak_text_color() }));
+                ui.label(format!("⏳ У черзі: {queued}"));
+                ui.label(RichText::new(format!("✔ Готово: {done}")).color(if done > 0 { green } else { ui.visuals().weak_text_color() }));
+                ui.label(RichText::new(format!("⚠ Помилок: {failed}")).color(if failed > 0 { red } else { ui.visuals().weak_text_color() }));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(format!("Загальна швидкість: {}", fmt_speed(total))).color(accent));
                 });
@@ -566,57 +659,89 @@ impl eframe::App for App {
         let mut start_inst = false;
         let mut paste = false;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Grab — завантажувач відео та музики");
+        let central_frame = egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(18.0));
+        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
+            ui.label(RichText::new("Завантажувач відео та музики").size(24.0).strong());
             if !self.ytdlp_ok || !self.ffmpeg_ok {
                 let (busy, msg, prog, err) = {
                     let i = self.install.lock().unwrap();
                     (i.busy, i.msg.clone(), i.progress, i.err.clone())
                 };
-                egui::Frame::group(ui.style()).show(ui, |ui| {
+                egui::Frame::group(ui.style()).rounding(10.0).inner_margin(12.0).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(RichText::new("Потрібні компоненти: yt-dlp та ffmpeg").strong());
+                    ui.label(RichText::new("⚙ Потрібні компоненти: yt-dlp та ffmpeg").strong());
                     if busy {
-                        ui.add(egui::ProgressBar::new(prog).show_percentage().fill(accent));
+                        ui.add(egui::ProgressBar::new(prog).show_percentage().fill(accent).desired_height(14.0).animate(true));
                         ui.label(msg);
                     } else {
                         if let Some(e) = err { ui.colored_label(Color32::from_rgb(230, 80, 80), e); }
-                        if ui.button("Встановити автоматично").clicked() { start_inst = true; }
+                        if color_button(ui, "⬇ Встановити автоматично", accent, 34.0).clicked() { start_inst = true; }
                     }
                 });
             }
-            ui.label("Встав посилання (кожне з нового рядка):");
-            ui.add(egui::TextEdit::multiline(&mut self.input).desired_rows(3).desired_width(f32::INFINITY));
+            ui.label(RichText::new("Встав посилання — кожне з нового рядка").weak());
+            ui.add(
+                egui::TextEdit::multiline(&mut self.input)
+                    .hint_text("https://www.youtube.com/watch?v=...")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            );
             ui.horizontal(|ui| {
-                if ui.button("Вставити з буфера").clicked() { paste = true; }
-                if ui.button("Додати в чергу").clicked() { add = true; }
-                if ui.button("Очистити завершені").clicked() { clear = true; }
+                if color_button(ui, "➕ Додати в чергу", accent, 34.0).clicked() { add = true; }
+                if soft_button(ui, "📋 Вставити з буфера", 34.0).clicked() { paste = true; }
+                if soft_button(ui, "🗑 Очистити завершені", 34.0).clicked() { clear = true; }
             });
+            ui.add_space(4.0);
             ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
+
+            if snapshot.is_empty() {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("⬇").size(48.0).color(accent));
+                    ui.label(RichText::new("Черга порожня").size(18.0).strong());
+                    ui.label(RichText::new("Встав посилання вище й натисни «Додати в чергу»").weak());
+                });
+            }
+
+            let card_fill = mix(ui.visuals().panel_fill, ui.visuals().text_color(), 0.05);
+            let card_border = mix(ui.visuals().panel_fill, ui.visuals().text_color(), 0.10);
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for it in &snapshot {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        let name = if it.title.is_empty() { &it.url } else { &it.title };
-                        ui.label(RichText::new(name).strong());
-                        ui.add(egui::ProgressBar::new(it.percent / 100.0).show_percentage().fill(accent));
-                        ui.horizontal(|ui| {
-                            match &it.status {
-                                Status::Queued => { ui.label("У черзі"); }
-                                Status::Running => {
-                                    ui.label(format!("{}  •  {}  •  ETA {}", it.speed, it.size, it.eta));
+                    egui::Frame::none()
+                        .fill(card_fill)
+                        .stroke(Stroke::new(1.0, card_border))
+                        .rounding(10.0)
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            let name = if it.title.is_empty() { &it.url } else { &it.title };
+                            ui.label(RichText::new(name).strong());
+                            ui.add(
+                                egui::ProgressBar::new(it.percent / 100.0)
+                                    .show_percentage()
+                                    .fill(accent)
+                                    .desired_height(14.0)
+                                    .animate(it.status == Status::Running),
+                            );
+                            ui.horizontal(|ui| {
+                                match &it.status {
+                                    Status::Queued => { ui.label(RichText::new("⏳ У черзі").weak()); }
+                                    Status::Running => {
+                                        ui.label(RichText::new(format!("{}  •  {}  •  ETA {}", it.speed, it.size, it.eta)).color(accent));
+                                    }
+                                    Status::Done => { ui.colored_label(Color32::from_rgb(80, 200, 120), "✔ Готово"); }
+                                    Status::Canceled => { ui.label(RichText::new("✖ Скасовано").weak()); }
+                                    Status::Failed(e) => { ui.colored_label(Color32::from_rgb(230, 80, 80), format!("⚠ {e}")); }
                                 }
-                                Status::Done => { ui.colored_label(Color32::from_rgb(80, 200, 120), "Готово"); }
-                                Status::Canceled => { ui.label("Скасовано"); }
-                                Status::Failed(e) => { ui.colored_label(Color32::from_rgb(230, 80, 80), e); }
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Видалити").clicked() { remove_ids.push(it.id); }
-                                if matches!(it.status, Status::Queued | Status::Running)
-                                    && ui.button("Скасувати").clicked() { cancel_ids.push(it.id); }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if soft_button(ui, "🗑 Видалити", 28.0).clicked() { remove_ids.push(it.id); }
+                                    if matches!(it.status, Status::Queued | Status::Running)
+                                        && color_button(ui, "✖ Скасувати", Color32::from_rgb(205, 75, 75), 28.0).clicked()
+                                    { cancel_ids.push(it.id); }
+                                });
                             });
                         });
-                    });
+                    ui.add_space(2.0);
                 }
             });
         });
@@ -655,7 +780,9 @@ impl eframe::App for App {
 
 fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1020.0, 660.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1020.0, 660.0])
+            .with_min_inner_size([780.0, 480.0]),
         ..Default::default()
     };
     eframe::run_native("Grab", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
